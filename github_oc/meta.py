@@ -132,18 +132,9 @@ class Meta:
     def __init__(self, oc: Client):
         self._oc = oc
         # method -> built form, so a picker rebuilds the dialog the button sits on.
+        # Every action form is here, because every repo picker names its own action.
         self._forms = {
-            "github.repos.list": forms.repos_list_form,
-            "github.repo.get": forms.repo_get_form,
-            "github.repo.collaborators": forms.repo_collaborators_form,
-            "github.repo.contents": forms.repo_contents_form,
-            "github.activity.list": forms.activity_list_form,
-            "github.repo.protection": forms.repo_protection_form,
-            "github.alerts.dependabot": forms.alerts_dependabot_form,
-            "github.alerts.secret_scanning": forms.alerts_secret_scanning_form,
-            "github.alerts.code_scanning": forms.alerts_code_scanning_form,
-            "github.org.members": forms.org_members_form,
-            "github.repo.settings": forms.repo_settings_form,
+            **forms.ACTION_FORMS,
             # The org picker on the settings dialog rebuilds the settings form.
             "github.settings": lambda: forms.settings_form().build(),
         }

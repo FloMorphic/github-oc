@@ -9,6 +9,8 @@
 #
 # It reaches the gateway two ways, both through that one NATS proxy:
 #   * CURATED actions  — POST /v1/actions/github.<action> {input}
+#     (everything oomol curates; which action each node operation runs is declared
+#     in ops.py, and the input is pruned to the live inputSchema below)
 #   * PROVIDER proxy   — POST /v1/proxy/github {endpoint, method, query, body}
 #     (a signed passthrough to https://api.github.com for what oomol does not
 #     curate: Dependabot / secret-scanning / code-scanning alerts, branch

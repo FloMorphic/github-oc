@@ -4,25 +4,34 @@
 # RAW GitHub REST call through oomol's provider proxy — and finishes the job with
 # exactly one terminal call on every path.
 #
-# Curated vs proxy. oomol declares every curated input with
-# additionalProperties:false and camelCase names (perPage, issueNumber …), so a
-# guessed field is a hard 400. Only actions whose schema is CONFIRMED against the
-# live catalog (GET /v1/actions?service=github) are called curated:
-# list_my_repositories, get_repository, list_commits. Everything else uses an
-# exact GitHub REST path through the proxy, where GitHub's own (snake_case)
-# parameter names apply. Scopes are not second-guessed here: oomol checks its
-# own requiredScopes for curated actions, GitHub answers 403 for the rest, and
-# both errors are rendered with their message.
+# CURATED FIRST. oomol curates ~150 GitHub actions, which ops.py maps surface by
+# surface; `node()` serves every one of them, so the only thing a curated surface
+# needs here is its table. oomol declares every curated input with
+# additionalProperties:false and camelCase names (perPage, issueNumber …), so the
+# spelling lives in ops.py and tests/test_ops.py checks it against the catalog
+# itself rather than against this file's memory of it.
+#
+# THE PROXY IS THE REMAINDER. Branch protection, Dependabot / secret-scanning /
+# code-scanning alerts, org membership, deploy keys / webhooks / Actions secrets
+# and the raw escape hatch are NOT curated by oomol, so they go through the
+# provider proxy as exact GitHub REST paths, where GitHub's own snake_case
+# parameter names apply. Those handlers are written out below.
+#
+# Scopes are not second-guessed: oomol checks its own requiredScopes for curated
+# actions (this plugin refuses a visibly under-scoped account first, to save a
+# round-trip), GitHub answers 403 for the rest, and both errors are rendered with
+# their message.
 #
 # This plugin is a pure request builder: it holds no GitHub token and makes no
 # GitHub calls. It builds and vets each request; FloMorphic proxies it.
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from inflow_plugin_sdk import Frame, Job, cast_request_to
 
+from . import ops
 from .oc import Client, GitHub, OcError
 from .vars import resolve_input_vars
 
@@ -36,6 +45,34 @@ def _int(v: Any, default: int) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def _blank(v: Any) -> bool:
+    """Whether a form field carries nothing: no value, an empty string, or an empty
+    list / object. `false` and `0` are values, and are sent."""
+    return v is None or v == "" or v == [] or v == {}
+
+
+def _unset(v: Any) -> bool:
+    """Whether a field was left unfilled. A number field the renderer hands back as
+    0 counts as unfilled: every number oomol curates is an id, a 1-based position or
+    a page, so 0 is the empty box rather than a value. A boolean false is a value."""
+    if _blank(v):
+        return True
+    return isinstance(v, int) and not isinstance(v, bool) and v == 0
+
+
+def _tri_bool(v: Any) -> Optional[bool]:
+    """Read a three-state toggle: "true"/"false" become booleans, anything else
+    (the untouched empty value) becomes None and is dropped. See forms.py."""
+    if isinstance(v, bool):
+        return v
+    text = _text(v).lower()
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    return None
 
 
 def _object(data: Any) -> dict[str, Any]:
@@ -60,6 +97,35 @@ def _query(**pairs: Any) -> dict[str, str]:
             continue
         out[key] = str(value)
     return out
+
+
+def _inputs(body: dict[str, Any], op: ops.Op) -> dict[str, Any]:
+    """Build one curated action's input from the form body: the fields the op
+    declares, under oomol's names, with the unfilled ones left out so a blank field
+    never overwrites anything. Raises ValueError on malformed JSON text."""
+    out: dict[str, Any] = {}
+    for spec in op.fields:
+        form_name, _, curated = spec.partition(":")
+        value = body.get(form_name)
+        if form_name in op.json:
+            value = _parse_json(value)
+        elif form_name in op.bools:
+            value = _tri_bool(value)
+        if _unset(value):
+            continue
+        out[curated or form_name] = value
+    return out
+
+
+def _op_name(body: dict[str, Any], table: ops.Table) -> str:
+    """Which operation the form picked. `op` is what every curated form sends;
+    `kind` and `scope` are the names three of these forms used before the curated
+    surface was widened, so a flow saved back then keeps its selection."""
+    for key in ("op", "kind", "scope"):
+        name = _text(body.get(key))
+        if name:
+            return name
+    return table.default
 
 
 _NO_OWNER = "no organization / owner set — open the node's account settings and fill Organization / owner"
@@ -138,118 +204,80 @@ class Actions:
         await job.progress(90, Frame(title=title, content="done"))
         await job.done(_object(data))
 
-    # ------------------------------------------------------ actions --
+    # ----------------------------------------------- curated surfaces --
 
-    async def repos_list(self, job: Job) -> None:
-        p = await self._prepare(job, need_owner=False)  # "mine" needs no owner
+    def handler_for(self, method: str) -> Callable[[Job], Awaitable[None]]:
+        """The handler one canvas action is wired to: the generic runner over the
+        surface's ops table, or the handler written out below when the surface needs
+        logic the table cannot express (search builds its own query) or is not
+        curated by oomol at all (the proxy surfaces)."""
+        own: dict[str, Callable[[Job], Awaitable[None]]] = {
+            "github.search": self.search,
+            "github.repo.protection": self.repo_protection,
+            "github.alerts.dependabot": self.alerts_dependabot,
+            "github.alerts.secret_scanning": self.alerts_secret_scanning,
+            "github.alerts.code_scanning": self.alerts_code_scanning,
+            "github.org.members": self.org_members,
+            "github.repo.settings": self.repo_settings,
+            "github.request": self.request,
+        }
+        return own.get(method) or self.node(method)
+
+    def node(self, method: str) -> Callable[[Job], Awaitable[None]]:
+        """The generic handler for a curated surface, bound to its ops table."""
+        table = ops.TABLES[method]
+
+        async def handler(job: Job) -> None:
+            await self._curated(job, table)
+
+        handler.__name__ = method.replace(".", "_")
+        return handler
+
+    async def _curated(self, job: Job, table: ops.Table) -> None:
+        """Run the curated action the form's operation names: resolve the target
+        (owner / repo from the profile), refuse an unfilled requirement or a
+        visibly under-scoped account, then hand oomol the pruned input."""
+        p = await self._prepare(job, need_owner=False)  # the op decides
         if p is None:
             return
-        if _text(p.body.get("scope")) != "mine" and not p.owner:
+        name = _op_name(p.body, table)
+        op = table.ops.get(name)
+        if op is None:
+            await job.done_with_error(
+                f"unknown operation {name!r} — expected one of {', '.join(table.names())}"
+            )
+            return
+        if op.scope != "none" and not p.owner:
             await job.done_with_error(_NO_OWNER)
             return
-        per_page, page = _int(p.body.get("perPage"), 30), _int(p.body.get("page"), 1)
-        sort = _text(p.body.get("sort")) or "full_name"
-        visibility = _text(p.body.get("visibility")) or "all"
-
-        if _text(p.body.get("scope")) == "mine":
-            # Curated — schema confirmed: visibility, sort, direction, perPage, page.
-            if await self._deny_curated(job, p.gh, "list_my_repositories", "list repositories"):
+        inputs: dict[str, Any] = {}
+        where = f"as {p.gh.account.name()}"
+        if op.scope == "repo":
+            repo = await self._repo(job, p)
+            if repo is None:
                 return
-            call = p.gh.action(
-                "list_my_repositories",
-                {"visibility": visibility, "sort": sort, "perPage": per_page, "page": page},
-            )
-            await self._run(job, "Listing repositories", f"as {p.gh.account.name()}", call)
+            inputs, where = {"owner": p.owner, "repo": repo}, f"{p.owner}/{repo}"
+        elif op.scope == "owner":
+            inputs, where = {"owner": p.owner}, p.owner
+        elif op.scope == "org":
+            inputs, where = {"org": p.owner}, p.owner
+        for field in op.needs:
+            if _unset(p.body.get(field)):
+                await job.done_with_error(f"missing required input: {field}")
+                return
+        try:
+            inputs.update(_inputs(p.body, op))
+        except ValueError as e:
+            await job.done_with_error(str(e))
             return
-
-        # The organization's — GET /orgs/{org}/repos. `type` is GitHub's
-        # visibility filter on this endpoint (all/public/private/…).
-        call = p.gh.rest(
-            "GET",
-            f"/orgs/{p.owner}/repos",
-            query=_query(type=visibility, sort=sort, per_page=per_page, page=page),
-        )
-        await self._run(job, "Listing repositories", p.owner, call)
-
-    async def repo_get(self, job: Job) -> None:
-        p = await self._prepare(job)
-        if p is None:
+        if await self._deny_curated(job, p.gh, op.action, op.verb()):
             return
-        repo = await self._repo(job, p)
-        if repo is None:
-            return
-        if await self._deny_curated(job, p.gh, "get_repository", "read the repository"):
-            return
-        await self._run(
-            job, "Getting repository", f"{p.owner}/{repo}",
-            p.gh.action("get_repository", {"owner": p.owner, "repo": repo}),
-        )
-
-    async def repo_collaborators(self, job: Job) -> None:
-        p = await self._prepare(job)
-        if p is None:
-            return
-        repo = await self._repo(job, p)
-        if repo is None:
-            return
-        query = _query(
-            affiliation=_text(p.body.get("affiliation")) or "all",
-            permission=_text(p.body.get("permission")),
-            per_page=_int(p.body.get("perPage"), 30),
-            page=_int(p.body.get("page"), 1),
-        )
-        await self._run(
-            job, "Listing collaborators", f"{p.owner}/{repo}",
-            p.gh.rest("GET", f"/repos/{p.owner}/{repo}/collaborators", query=query),
-        )
-
-    async def repo_contents(self, job: Job) -> None:
-        p = await self._prepare(job)
-        if p is None:
-            return
-        repo = await self._repo(job, p)
-        if repo is None:
-            return
-        path = _text(p.body.get("path")).lstrip("/")
-        await self._run(
-            job, "Getting contents", f"{p.owner}/{repo}/{path}",
-            p.gh.rest("GET", f"/repos/{p.owner}/{repo}/contents/{path}", query=_query(ref=_text(p.body.get("ref")))),
-        )
-
-    async def activity_list(self, job: Job) -> None:
-        p = await self._prepare(job)
-        if p is None:
-            return
-        repo = await self._repo(job, p)
-        if repo is None:
-            return
-        per_page, page = _int(p.body.get("perPage"), 30), _int(p.body.get("page"), 1)
-        if _text(p.body.get("kind")) == "workflow_runs":
-            call = p.gh.rest(
-                "GET",
-                f"/repos/{p.owner}/{repo}/actions/runs",
-                query=_query(status=_text(p.body.get("status")), per_page=per_page, page=page),
-            )
-            await self._run(job, "Listing workflow runs", f"{p.owner}/{repo}", call)
-            return
-        # Curated — schema confirmed: owner, repo, sha, path, author, committer,
-        # since, until, perPage, page.
-        if await self._deny_curated(job, p.gh, "list_commits", "list commits"):
-            return
-        call = p.gh.action(
-            "list_commits",
-            {
-                "owner": p.owner,
-                "repo": repo,
-                "sha": _text(p.body.get("sha")),
-                "since": _text(p.body.get("since")),
-                "perPage": per_page,
-                "page": page,
-            },
-        )
-        await self._run(job, "Listing commits", f"{p.owner}/{repo}", call)
+        await self._run(job, op.title(), where, p.gh.action(op.action, inputs))
 
     async def search(self, job: Job) -> None:
+        """`github.search` — the curated searches. The query is assembled here,
+        because the "within the organization" prefix is this plugin's convenience
+        rather than an oomol input; everything else comes from the table."""
         p = await self._prepare(job, need_owner=False)  # owner only when scoping to the org
         if p is None:
             return
@@ -263,14 +291,18 @@ class Actions:
                 return
             if f"org:{p.owner}" not in q and f"user:{p.owner}" not in q:
                 q = f"org:{p.owner} {q}"
-        kind = _text(p.body.get("kind")) or "repositories"
-        endpoint = {"repositories": "/search/repositories", "code": "/search/code", "issues": "/search/issues"}.get(
-            kind, "/search/repositories"
-        )
-        await self._run(
-            job, "Searching GitHub", q,
-            p.gh.rest("GET", endpoint, query=_query(q=q, per_page=_int(p.body.get("perPage"), 30), page=_int(p.body.get("page"), 1))),
-        )
+        name = _op_name(p.body, ops.SEARCH)
+        op = ops.SEARCH.ops.get(name)
+        if op is None:
+            await job.done_with_error(
+                f"unknown operation {name!r} — expected one of {', '.join(ops.SEARCH.names())}"
+            )
+            return
+        inputs: dict[str, Any] = {"query": q}
+        inputs.update(_inputs(p.body, op))
+        if await self._deny_curated(job, p.gh, op.action, op.verb()):
+            return
+        await self._run(job, f"Searching {name}", q, p.gh.action(op.action, inputs))
 
     # --------------------------------------- security surface (proxy) --
 

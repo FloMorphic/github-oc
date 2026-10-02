@@ -1,7 +1,7 @@
 [project]
 name = "inflow-github-oc-plugin"
-version = "0.1.0"
-description = "Inflowenger plugin node for GitHub over OpenConnector (FloMorphic Connect) — repos, activity, search, and the security surface (alerts, branch protection, org members)."
+version = "0.2.0"
+description = "Inflowenger plugin node for GitHub over OpenConnector (FloMorphic Connect) — every curated GitHub action (repos, contents, branches, commits, issues, pull requests, reviews, releases, Actions, search) plus the security surface (alerts, branch protection, org members)."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Mehdi Shokohifar", email = "mehdi.shokohifar@gmail.com" }]

@@ -5,8 +5,8 @@
 #
 # A canvas action is named in exactly three places: here (its title, blurb and
 # icon), in forms.py (its dialog) and in ops.py (the curated action each of its
-# operations runs). The order of _CURATED and _PROXIED is the order the canvas
-# shows them in.
+# operations runs). The order of _CURATED, _PROXIED and _LOCAL is the order the
+# canvas shows them in.
 from __future__ import annotations
 
 from inflow_plugin_sdk import Action, Icon, Meta as SdkMeta, Settings
@@ -87,6 +87,19 @@ _PROXIED: tuple[tuple[str, str, str, str], ...] = (
 )
 
 
+# The one action that runs on the plugin host instead of at the gateway: no
+# gateway can hand over a working tree. Its permission still comes from
+# OpenConnector — see actions.repo_clone and clone.py.
+_LOCAL: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "github.repo.clone",
+        "Clone repository",
+        "Clone a repository onto the plugin host with git, gated by the connected account's access.",
+        "mdi-folder-download",
+    ),
+)
+
+
 class Registry:
     def __init__(self, send: Send):
         self._oc = Client(send)
@@ -118,6 +131,17 @@ class Registry:
                 request_handler=self._actions.handler_for(method),
             )
             for method, title, description, icon in _PROXIED
+        )
+        out.extend(
+            Action(
+                method=method,
+                title=title,
+                description=description,
+                icon=Icon(icon=icon),
+                form=forms.ACTION_FORMS[method](),
+                request_handler=self._actions.handler_for(method),
+            )
+            for method, title, description, icon in _LOCAL
         )
         return out
 

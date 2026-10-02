@@ -5,9 +5,10 @@ central **Connect** feature (OpenConnector / oomol), built on
 [`inflowenger-plugin-sdk`](https://pypi.org/project/inflowenger-plugin-sdk/) — the
 first `-oc` plugin written in **Python**.
 
-It appears on the workflow canvas as a **GitHub (OpenConnector)** node with **52
+It appears on the workflow canvas as a **GitHub (OpenConnector)** node with **53
 actions** that together reach **every one of the ~150 GitHub actions oomol
-curates**, plus the security surface oomol does not. It holds **no GitHub
+curates**, plus the security surface oomol does not — and one action, `Clone
+repository`, that runs git on the host. It holds **no GitHub
 credentials** and makes **no GitHub API calls** — it is a *request builder*. A
 GitHub account is connected **once, centrally**, in **FloMorphic → Connect**; this
 node just picks which connected account to act as, and asks the FloMorphic backend
@@ -160,6 +161,83 @@ against oomol's own catalog.
 | `github.search`           | Search GitHub          | `repositories` · `code` · `issues` · `users` · `commits` · `topics` |
 | `github.events`           | List events            | `repository` · `public` · `user_public` · `user_received_public` · `user_all` · `user_received` |
 
+### Clone — the one local action
+
+| Method | Title | Notes |
+|--------|-------|-------|
+| `github.repo.clone` | Clone repository | runs `git` on the plugin host; authorized by the connected account's access |
+
+oomol curates no clone, and it could not: a clone is a git transport onto a
+filesystem, not a REST call. Nor can the gateway be made to carry one —
+[`ocproxy.go`](../../FloMorphicProject/flomorphic-api/inflow/ocproxy.go) injects
+the **oomol** token (never GitHub's), its reply is `{status, body, error}` with no
+headers, and a body that is not JSON comes back as a JSON *string*, so neither a
+credential nor a binary tarball can be extracted through it. So `clone` shells out
+to `git` — and **git is the only thing the host must have**.
+
+**Permission still comes from OpenConnector.** Before git runs, the repository is
+read *as the connected account* (`get_repository`). A 404 means that account cannot
+see it, and the clone is refused.
+
+A read that succeeds **is** the read grant: GitHub answers 404 for a repository a
+token may not see, so a record coming back proves `pull` — for a private repository
+as much as a public one. That matters because **oomol's curated reply carries no
+permission at all**: `get_repository` projects GitHub's payload onto the handful of
+fields its output schema names, and `permissions` is not one of them. A gate waiting
+for that field could only ever refuse.
+
+So **`pull` costs no extra call**, and only a form set to **Require permission:
+push/admin** goes looking further — first GitHub's own repository payload through
+the provider proxy (which does carry `permissions`), then
+`get_repository_permission_for_user` for the connected login (which itself wants
+admin on the repository). If neither can confirm it, the clone is refused saying
+exactly that, rather than claiming the account has no access. The result reports
+`permission` alongside `permissionSource`, so which of the four routes answered is
+visible in the flow.
+
+**The clone URL is derived, not trusted to the reply.** `clone_url` / `ssh_url` are
+declared by oomol's schema but not reliably sent, and the URL is fully determined by
+the host, owner and name — so the reply is used when it has one, and
+`https://<host>/<owner>/<repo>.git` or `git@<host>:<owner>/<repo>.git` is built
+otherwise, the host taken from whatever URL the reply does carry so a GitHub
+Enterprise Server host still works. `private` is treated the same way: absent means
+*unknown*, not public, so the clone is attempted and git's own authentication error
+speaks — with a hint naming the input to fill.
+
+**Credentials for git itself.** This plugin holds none, and OpenConnector will not
+hand the GitHub token out, so:
+
+| Repository | What git uses |
+|------------|---------------|
+| public, HTTPS | nothing — anonymous clone, no host preparation at all |
+| private, HTTPS | the **Token** input, best filled from an upstream node with `{{$.path}}` so the value is not written into the flow |
+| private, SSH | the key already on the host (`Transport: SSH`) |
+
+A supplied token is written to a private temporary git config as an
+`http.extraheader` bound to the remote's own host — the way GitHub's own checkout
+action does it — so it never appears in `argv` (world-readable via `ps`), never
+lands in the clone's `.git/config` or remote URL, and is scrubbed from anything the
+node reports. A private repo over HTTPS with no token is refused with that
+explanation rather than left to hang on a credential prompt
+(`GIT_TERMINAL_PROMPT=0`).
+
+**Where the files go.** One root — `GITHUB_OC_CLONE_ROOT`, default `./workspace`
+beside the plugin. The form's destination is **relative** to it and must resolve
+inside it: absolute paths, `..`, and symlinks pointing out are all refused, the
+containment being checked on the deepest part of the path that already exists. The
+paths are on the **plugin host**, not on the machine running the browser.
+
+The clone URL is taken from GitHub's own record rather than built here, and its
+transport is checked against https / ssh / git / file before git sees it — git's
+`ext::` transport runs a shell command, and a URL arriving as JSON from a remote
+service is not the place to trust that.
+
+**An existing directory is never clobbered.** *Fail* (default) refuses it;
+*Fetch into it* and *Clone it again* act only on a checkout whose `origin` is this
+same repository — anything else, including an unrelated git repo, is left
+untouched. `GITHUB_OC_CLONE_TIMEOUT` (default 600s) stops a runaway clone, and
+`GITHUB_OC_GIT` points at git when it is not on `PATH`.
+
 ### The surface oomol does not curate (provider proxy)
 
 | Method | Title | Notes |
@@ -211,7 +289,8 @@ github_oc/
   ops.py                    every curated action, by surface and operation (the source of truth)
   forms.py                  settings + action forms (formkit)
   meta.py                   meta RPCs (account/org/repo pickers) + settings submit
-  actions.py                the job pipeline: one generic curated runner + the proxy handlers
+  actions.py                the job pipeline: one generic curated runner + the proxy handlers + the gated clone
+  clone.py                  the local git clone: the root, path containment, per-call token config
   vars.py                   {{$...}} token resolution
   registry.py               wires actions + metas + settings
 openconnector-github-schema.json   oomol's GitHub catalog, as the gateway returns it
@@ -259,6 +338,9 @@ required is missing, and the whole catalog is reachable from the canvas.
 - **Not curated, so not exposed as its own action.** Uploading a release asset
   (it goes to a separate GitHub upload host) and creating a repository *inside an
   organization* have no curated action; use **Raw GitHub request**.
+- **`Clone repository` needs git on the host** and writes to the plugin's
+  filesystem — the only action that does either. Its tests clone a real repository
+  over `file://`, so they need git but no network.
 - **Rate limits.** Org-wide alert listing over many repos burns the REST budget;
   the org-scoped `/orgs/{org}/…/alerts` endpoints are used where they exist (one
   call per org), and paging is exposed on every list action.

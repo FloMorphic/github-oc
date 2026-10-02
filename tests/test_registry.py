@@ -3,7 +3,7 @@ method names are unique, and the curated ones are exactly the ops tables."""
 from __future__ import annotations
 
 from github_oc import forms, ops
-from github_oc.registry import _CURATED, _PROXIED, Registry
+from github_oc.registry import _CURATED, _LOCAL, _PROXIED, Registry
 
 
 async def _send(subject: str, data: bytes):
@@ -16,7 +16,7 @@ def registry() -> Registry:
 
 def test_every_action_builds_with_a_form_and_a_handler():
     actions = registry().all_actions()
-    assert len(actions) == len(_CURATED) + len(_PROXIED)
+    assert len(actions) == len(_CURATED) + len(_PROXIED) + len(_LOCAL)
     for a in actions:
         assert a.title and a.description and a.icon
         assert a.form.jsonschema and a.form.jsonui
@@ -34,8 +34,8 @@ def test_the_curated_actions_are_exactly_the_ops_tables():
 
 def test_every_action_is_declared_in_all_three_places():
     """A canvas action needs its row here, its form in forms.py, and — unless it is
-    one of the proxy surfaces — its table in ops.py."""
-    declared = {m for m, *_ in _CURATED} | {m for m, *_ in _PROXIED}
+    a proxy surface or the local clone — its table in ops.py."""
+    declared = {m for m, *_ in _CURATED} | {m for m, *_ in _PROXIED} | {m for m, *_ in _LOCAL}
     assert declared == set(forms.ACTION_FORMS)
 
 

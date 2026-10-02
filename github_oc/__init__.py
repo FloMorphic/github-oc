@@ -13,6 +13,11 @@ surface in ops.py. The security surface oomol does not curate (Dependabot /
 secret-scanning / code-scanning alerts, branch protection, org members, repo
 settings) is reached through oomol's provider proxy over the same central
 credential.
+
+One action is local: `clone` runs git on the plugin host, because no gateway can
+hand over a working tree. Its permission still comes from OpenConnector — the
+repository is read as the connected account, and the clone is refused unless that
+account's own access grants it. See clone.py.
 """
 
 __version__ = "v0.2.0"

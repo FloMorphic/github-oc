@@ -78,6 +78,7 @@ surface, and the form shows only the inputs that operation uses.
 | **Org members**             | Members (2FA filter), admins, or outside collaborators. |
 | **Repo settings**           | Deploy keys, webhooks, Actions permissions & secret names. |
 | **Raw GitHub request**      | Any other GitHub REST endpoint (escape hatch). |
+| **Clone repository**        | Clone it onto the machine the plugin runs on (see below). |
 
 Text inputs accept `{{$.path}}` tokens resolved against the flow scope, so a
 `repo`, an issue body or a query can reference upstream data. **Repository**
@@ -87,6 +88,42 @@ repositories.
 **Nothing you leave empty is sent.** On the forms that change a GitHub setting,
 toggles are *empty / true / false* rather than checkboxes — an untouched one keeps
 the current value instead of switching it off.
+
+## Clone repository
+
+The only action that touches a filesystem. It runs `git` on the **plugin host** —
+not on your machine — and the files land under the plugin's clone root
+(`GITHUB_OC_CLONE_ROOT`, or `./workspace` beside the plugin). **Destination** is a
+path relative to that root; absolute paths and `..` are refused.
+
+**It is allowed by your org access.** The repository is read as the connected
+account first, and one that account cannot see is refused — GitHub hides a private
+repository from a token without access, so a successful read is itself proof of the
+read access a clone needs.
+
+**Require permission** is *pull* by default, which is exactly that, and costs no
+extra call. Set it to *push* or *admin* when the flow goes on to commit: the node
+then asks GitHub for the account's real permission and refuses if it cannot be
+confirmed — saying so plainly, since OpenConnector's own reply does not report
+permissions.
+
+**Credentials.** OpenConnector keeps the GitHub token inside the gateway and never
+hands it out, so git needs its own:
+
+- **Public repository** — nothing to do. It clones anonymously.
+- **Private over HTTPS** — put a GitHub token in **Token**. Best filled from an
+  upstream node with a `{{$.path}}` token, so the value is not written into the
+  flow. It is used for that one clone: never stored in `.git/config`, never in the
+  remote URL, never printed back.
+- **Private over SSH** — set **Transport: SSH** and the host's own key answers for
+  it.
+
+**An existing directory is safe.** *Fail* refuses it; *Fetch into it* and *Clone it
+again* only ever act on a checkout of this same repository — anything else is left
+untouched.
+
+The host needs **git installed** and nothing else; if it is missing the node says
+so instead of failing obscurely.
 
 ## Try it — live checks
 

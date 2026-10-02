@@ -1599,6 +1599,82 @@ def search_form() -> FormBuilder:
     )
 
 
+# ------------------------------------------------- clone (local to the host) --
+
+
+def repo_clone_form() -> FormBuilder:
+    """`github.repo.clone` — clone onto the machine the plugin runs on."""
+    return (
+        formkit.form("Clone repository")
+        .describe(
+            "Runs git on the PLUGIN HOST, not on your machine. The destination is "
+            "relative to the plugin's clone root (GITHUB_OC_CLONE_ROOT, or ./workspace "
+            "beside the plugin) and cannot escape it. The connected account's access to "
+            "the repository is checked first: no access, no clone."
+        )
+        .add(
+            _repo("github.repo.clone"),
+            formkit.text("destination", "Destination").describe(
+                "A path relative to the clone root, e.g. acme/api. Empty uses the "
+                "repository name. Absolute paths and '..' are refused."
+            ),
+            formkit.text("ref", "Branch / tag / commit").describe(
+                "What to check out. Empty uses the default branch."
+            ),
+            formkit.integer("depth", "Depth")
+            .default(1)
+            .min(0)
+            .describe("Shallow-clone this many commits. 0 clones the full history."),
+            formkit.boolean("singleBranch", "Single branch")
+            .default(True)
+            .describe("Fetch only the branch being checked out. Ignored when Depth is 0."),
+            formkit.boolean("submodules", "Submodules")
+            .default(False)
+            .describe("Also clone submodules. They may need their own credentials."),
+            formkit.enum_("minPermission", "Require permission", "pull", "push", "admin")
+            .default("pull")
+            .describe(
+                "Refuse unless the connected account holds at least this permission on "
+                "the repository. pull is enough to clone; require push when the flow "
+                "goes on to commit."
+            ),
+            formkit.choice(
+                "transport",
+                "Transport",
+                Option("https", "HTTPS"),
+                Option("ssh", "SSH (the host's key)"),
+            )
+            .default("https")
+            .describe(
+                "HTTPS clones anonymously, or with the Token below. SSH uses the key "
+                "already configured on the plugin host and needs no token."
+            ),
+            formkit.text("token", "Token (private repos over HTTPS)")
+            .describe(
+                "A GitHub token for git to authenticate with. This plugin holds none — "
+                "OpenConnector keeps the credential inside the gateway and never hands it "
+                "out — so a private repository needs one here, best as a {{$.path}} token "
+                "from an upstream node so the value is not written into the flow. It is "
+                "used for this one clone, never stored in .git/config or the remote URL. "
+                "Leave empty for a public repository, or when using SSH."
+            )
+            .show_when("transport", "https"),
+            formkit.choice(
+                "onExisting",
+                "If it already exists",
+                Option("fail", "Fail"),
+                Option("reuse", "Fetch into it"),
+                Option("replace", "Clone it again"),
+            )
+            .default("fail")
+            .describe(
+                "Reuse and Clone again only act on a checkout of THIS repository — a "
+                "directory holding anything else is never touched."
+            ),
+        )
+        .build()
+    )
+
 # ---------------------------------------------- provider-proxy (security) --
 #
 # What follows is NOT curated by oomol: these go through the provider proxy as
@@ -1807,6 +1883,7 @@ ACTION_FORMS = {
     "github.releases": releases_form,
     "github.release.assets": release_assets_form,
     "github.search": search_form,
+    "github.repo.clone": repo_clone_form,
     "github.repo.protection": repo_protection_form,
     "github.alerts.dependabot": alerts_dependabot_form,
     "github.alerts.secret_scanning": alerts_secret_scanning_form,

@@ -22,15 +22,22 @@
 # round-trip), GitHub answers 403 for the rest, and both errors are rendered with
 # their message.
 #
-# This plugin is a pure request builder: it holds no GitHub token and makes no
-# GitHub calls. It builds and vets each request; FloMorphic proxies it.
+# ONE ACTION IS LOCAL. `clone` runs git on the plugin host, because no gateway can
+# hand over a working tree (see clone.py). It still takes its PERMISSION from
+# OpenConnector: the repository is read as the connected account first, and the
+# clone is refused unless that account's own access grants it.
+#
+# Otherwise this plugin is a pure request builder: it holds no GitHub token and
+# makes no GitHub calls. It builds and vets each request; FloMorphic proxies it.
 from __future__ import annotations
 
 import json
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import urlsplit
 
 from inflow_plugin_sdk import Frame, Job, cast_request_to
 
+from . import clone as git_clone
 from . import ops
 from .oc import Client, GitHub, OcError
 from .vars import resolve_input_vars
@@ -130,6 +137,113 @@ def _op_name(body: dict[str, Any], table: ops.Table) -> str:
 
 _NO_OWNER = "no organization / owner set — open the node's account settings and fill Organization / owner"
 
+# GitHub's repository permissions, weakest first. `pull` is enough to clone; a flow
+# that clones in order to push should require `push`.
+_PERMISSIONS = ("pull", "triage", "push", "maintain", "admin")
+
+
+def _permission(record: dict[str, Any]) -> Optional[str]:
+    """The strongest permission the CONNECTED account holds on a repository, read
+    from the `permissions` object GitHub puts on the record it returns for the
+    authenticated user. None when the record did not carry one."""
+    granted = record.get("permissions")
+    if not isinstance(granted, dict):
+        return None
+    for name in reversed(_PERMISSIONS):
+        if granted.get(name) is True:
+            return name
+    return None
+
+
+def _permits(granted: Optional[str], wanted: str) -> bool:
+    """Whether `granted` is at least `wanted`. An unknown grant permits nothing —
+    the clone is refused rather than attempted."""
+    if granted is None:
+        return False
+    try:
+        return _PERMISSIONS.index(granted) >= _PERMISSIONS.index(wanted)
+    except ValueError:
+        # A role name GitHub invented after this list (a custom repository role);
+        # it is a real grant, so treat it as sufficient for a read.
+        return wanted == "pull"
+
+
+def _host_of(record: dict[str, Any]) -> str:
+    """The GitHub host this repository lives on, taken from whatever URL the reply
+    happens to carry so a GitHub Enterprise Server host is honoured, and
+    github.com only as the last resort."""
+    for key in ("html_url", "clone_url", "ssh_url"):
+        value = record.get(key)
+        if not isinstance(value, str) or "://" not in value:
+            continue
+        host = urlsplit(value).netloc.rsplit("@", 1)[-1]
+        if host:
+            return host
+    return "github.com"
+
+
+def _clone_url(record: dict[str, Any], owner: str, repo: str, ssh: bool) -> str:
+    """The URL git clones from.
+
+    oomol's curated get_repository projects GitHub's payload onto a handful of
+    fields and does not reliably carry clone_url / ssh_url, so the reply is used
+    when it has one and the URL is otherwise derived — it is fully determined by
+    the host, the owner and the name."""
+    given = _text(record.get("ssh_url" if ssh else "clone_url"))
+    if given:
+        return given
+    host = _host_of(record)
+    if ssh:
+        return f"git@{host}:{owner}/{repo}.git"
+    return f"https://{host}/{owner}/{repo}.git"
+
+
+def _is_private(record: dict[str, Any]) -> Optional[bool]:
+    """Whether the repository is private, or None when the reply does not say.
+
+    Unknown is not "public": it only means the clone cannot be refused up front for
+    want of a credential, and git's own authentication error has to speak instead."""
+    if isinstance(record.get("private"), bool):
+        return record["private"]
+    visibility = _text(record.get("visibility")).lower()
+    if visibility in ("private", "internal"):
+        return True
+    if visibility == "public":
+        return False
+    return None
+
+
+def _insufficient(
+    gh: GitHub, owner: str, repo: str, granted: str, wanted: str, source: str, implied: bool
+) -> str:
+    """Phrase a refusal so it says what to change. When the grant is only the read
+    access the lookup proved, the honest answer is that nothing more could be
+    confirmed — not that the account has no access."""
+    head = (
+        f'the account "{gh.account.name()}" has {granted} access to {owner}/{repo} '
+        f"({source}), and this node requires {wanted}"
+    )
+    if implied:
+        return (
+            f"{head} — OpenConnector's reply carries no permission, and GitHub reports one "
+            "only to a token that may read it (its permission endpoint wants admin on the "
+            "repository), so nothing above read access could be confirmed. Set Require "
+            "permission to pull if cloning is all this flow does."
+        )
+    return f"{head} — grant it in the organization, or lower Require permission"
+
+
+def _no_access(gh: GitHub, owner: str, repo: str, error: OcError) -> str:
+    """Phrase a failed repository read as what it almost always is: the connected
+    account cannot see that repository."""
+    text = str(error)
+    if "404" in text or "Not Found" in text:
+        return (
+            f'the account "{gh.account.name()}" cannot see {owner}/{repo} — it does not '
+            "exist, or the connection's organization access does not include it"
+        )
+    return text
+
 
 class _Prep:
     """What every handler starts from: the bound account handle, the decoded
@@ -213,6 +327,7 @@ class Actions:
         curated by oomol at all (the proxy surfaces)."""
         own: dict[str, Callable[[Job], Awaitable[None]]] = {
             "github.search": self.search,
+            "github.repo.clone": self.repo_clone,
             "github.repo.protection": self.repo_protection,
             "github.alerts.dependabot": self.alerts_dependabot,
             "github.alerts.secret_scanning": self.alerts_secret_scanning,
@@ -303,6 +418,144 @@ class Actions:
         if await self._deny_curated(job, p.gh, op.action, op.verb()):
             return
         await self._run(job, f"Searching {name}", q, p.gh.action(op.action, inputs))
+
+    # ------------------------------------------ clone (local, gated) --
+
+    async def repo_clone(self, job: Job) -> None:
+        """`github.repo.clone` — clone a repository onto the plugin host.
+
+        The clone itself is git on this machine (clone.py), but the RIGHT to make it
+        comes from OpenConnector: the repository is read as the connected account, so
+        one that account cannot see is refused before git is run. The read doubles as
+        the proof of read access — GitHub hides what a token may not see — and only a
+        node asked to require more than that spends calls establishing it."""
+        p = await self._prepare(job)
+        if p is None:
+            return
+        repo = await self._repo(job, p)
+        if repo is None:
+            return
+        if await self._deny_curated(job, p.gh, "get_repository", "read the repository"):
+            return
+
+        await job.progress(10, Frame(title="Checking access", content=f"{p.owner}/{repo}"))
+        try:
+            record = await p.gh.action("get_repository", {"owner": p.owner, "repo": repo})
+        except OcError as e:
+            await job.done_with_error(_no_access(p.gh, p.owner, repo, e))
+            return
+        if not isinstance(record, dict):
+            await job.done_with_error(f"unexpected reply reading {p.owner}/{repo}")
+            return
+
+        # WHERE THE PERMISSION COMES FROM. oomol's curated reply carries no
+        # permission at all — get_repository projects GitHub's payload onto the
+        # twelve fields its output schema names, and `permissions` is not one of
+        # them. What the read DOES establish is read access: GitHub answers 404 for
+        # a repository the token cannot see, so a record coming back at all is the
+        # pull grant, for a private repository as much as a public one. Anything
+        # above read access has to be asked for separately, and only is when this
+        # node is set to require it.
+        wanted = _text(p.body.get("minPermission")) or "pull"
+        granted, source = _permission(record), "the repository record"
+        if granted is None and wanted != "pull":
+            granted, source = await self._lookup_permission(p, repo)
+        implied = granted is None
+        if implied:
+            granted, source = "pull", "reading the repository as this account"
+        if not _permits(granted, wanted):
+            await job.done_with_error(
+                _insufficient(p.gh, p.owner, repo, granted, wanted, source, implied)
+            )
+            return
+
+        token = _text(p.body.get("token"))
+        private = _is_private(record)
+        ssh = _text(p.body.get("transport")) == "ssh"
+        url = _clone_url(record, p.owner, repo, ssh)
+        if private and not token and not ssh:
+            await job.done_with_error(
+                f"{p.owner}/{repo} is private, so git needs a credential this plugin does not "
+                "hold: put a GitHub token in the Token input (a {{$.path}} token from an "
+                "upstream node keeps it out of the flow), or switch Transport to SSH and let "
+                "the host's key answer for it"
+            )
+            return
+
+        try:
+            base = git_clone.root()
+            dest = git_clone.resolve_dest(base, _text(p.body.get("destination")) or repo)
+        except git_clone.CloneError as e:
+            await job.done_with_error(str(e))
+            return
+
+        depth = max(0, _int(p.body.get("depth"), 1))
+        await job.progress(
+            40, Frame(title="Cloning", content=f"{p.owner}/{repo} → {dest} ({granted} access)")
+        )
+        try:
+            out = await git_clone.clone(
+                url=url,
+                dest=dest,
+                ref=_text(p.body.get("ref")),
+                depth=depth,
+                single_branch=p.body.get("singleBranch", True) is not False,
+                submodules=p.body.get("submodules") is True,
+                token=token,
+                on_existing=_text(p.body.get("onExisting")) or "fail",
+            )
+        except git_clone.CloneError as e:
+            await job.done_with_error(str(e))
+            return
+        await job.progress(90, Frame(title="Cloning", content="done"))
+        await job.done(
+            {
+                **out,
+                "owner": p.owner,
+                "repo": repo,
+                "full_name": record.get("full_name") or f"{p.owner}/{repo}",
+                "private": private,
+                "url": url,
+                "permission": granted,
+                "permissionSource": source,
+                "root": str(base),
+                "transport": "ssh" if ssh else "https",
+                "authenticated": bool(token) or ssh,
+            }
+        )
+
+    async def _lookup_permission(self, p: _Prep, repo: str) -> "tuple[Optional[str], str]":
+        """Establish MORE than read access, which oomol's curated reply cannot show.
+
+        Two sources, both best-effort — a failure leaves the access unknown rather
+        than refusing on its own:
+          * GitHub's own repository payload through the provider proxy, which does
+            carry `permissions` for the authenticated token;
+          * GitHub's permission endpoint for the connected login, which answers a
+            role name but itself wants admin on the repository."""
+        try:
+            raw = await p.gh.rest("GET", f"/repos/{p.owner}/{repo}")
+            granted = _permission(raw) if isinstance(raw, dict) else None
+            if granted:
+                return granted, "GitHub's repository permissions"
+        except OcError:
+            pass
+        try:
+            me = await p.gh.action("get_current_user", {})
+            login = me.get("login") if isinstance(me, dict) else None
+            if not login:
+                return None, ""
+            answer = await p.gh.action(
+                "get_repository_permission_for_user",
+                {"owner": p.owner, "repo": repo, "username": str(login)},
+            )
+        except OcError:
+            return None, ""
+        if isinstance(answer, dict):
+            value = answer.get("permission")
+            if isinstance(value, str) and value not in ("", "none"):
+                return value, "GitHub's permission endpoint"
+        return None, ""
 
     # --------------------------------------- security surface (proxy) --
 
